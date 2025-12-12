@@ -1,0 +1,4 @@
+streamlit
+pandas
+curl_cffi
+beautifulsoup4
