@@ -6,32 +6,43 @@ from datetime import datetime, timedelta, date
 from curl_cffi import requests
 from bs4 import BeautifulSoup
 
-# --- CONFIGURATION ---
+# --- PAGE CONFIG ---
 st.set_page_config(
     page_title="Delay Repay Finder",
     page_icon="🚄",
     layout="centered"
 )
 
-# Apply custom CSS for the Dark Mode aesthetic matching your preferences
+# --- CSS FOR DARK MODE & CLEAN UI ---
 st.markdown("""
     <style>
+    /* Force Dark Theme adjustments if system default varies */
     .stApp {
         background-color: #0e1117;
-        color: #fafafa;
+        color: #e0e0e0;
     }
+    /* Headers */
     h1, h2, h3 {
-        font-family: 'Segoe UI', sans-serif;
         color: #4fc3f7 !important;
+        font-family: 'Segoe UI', sans-serif;
     }
-    /* Hide row indices in dataframe */
+    /* Button Styling */
+    div.stButton > button {
+        background-color: #2e7d32;
+        color: white;
+        border: none;
+    }
+    div.stButton > button:hover {
+        background-color: #1b5e20;
+    }
+    /* Hide dataframe index */
     thead tr th:first-child {display:none}
     tbody th {display:none}
     </style>
     """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. LOGIC & SCRAPING
+# 1. PARSING & SCRAPING ENGINE
 # ==========================================
 
 def clean_time(t_str):
@@ -42,14 +53,19 @@ def clean_time(t_str):
     except: return None
 
 def format_date_ordinal(d):
+    """Formats date as '10th Dec'"""
     day = d.day
     suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
     return f"{day}{suffix} {d.strftime('%b')}"
 
 def normalize_station_name(name):
+    """Normalize for matching: 'London Charing Cross' -> 'charingcross'"""
     return name.lower().replace("london", "").replace(" ", "").replace("international", "").strip()
 
 def fetch_detailed_departure(service_url, target_station_name):
+    """
+    Fetches detailed schedule to find Planned Dep from the boarding station.
+    """
     try:
         full_url = f"https://www.realtimetrains.co.uk{service_url}"
         if "?" not in full_url: full_url += "?detailed=true"
@@ -60,21 +76,27 @@ def fetch_detailed_departure(service_url, target_station_name):
         
         soup = BeautifulSoup(resp.text, 'html.parser')
         locs = soup.find_all('div', class_='location')
+        
         target_clean = normalize_station_name(target_station_name)
         
         for i, loc in enumerate(locs):
             name_div = loc.find('div', class_='name')
             if not name_div: continue
+            
             row_name = normalize_station_name(name_div.get_text(strip=True))
             
             if target_clean in row_name or row_name in target_clean:
+                # 1. Explicit Departure Block
                 dep_block = loc.find('div', class_='dep')
                 if dep_block:
                     plan = dep_block.find('div', class_='plan')
                     if plan: return plan.get_text(strip=True)
+                
+                # 2. Origin Station (often lacks .dep block)
                 if i == 0:
                     plans = loc.find_all('div', class_='plan')
                     if plans: return plans[-1].get_text(strip=True)
+                            
         return "-"
     except: return "?"
 
@@ -102,7 +124,12 @@ def parse_row_text(text):
             status = "LATE/EARLY"
         else:
             status = "NO REPORT"
+            
     return origin, sched_str, act_str, status
+
+# ==========================================
+# 2. LOGIC
+# ==========================================
 
 def process_delays(trains_df):
     if trains_df.empty: return trains_df
@@ -129,6 +156,7 @@ def process_delays(trains_df):
                 if candidate['status_raw'] != "CANCELLED":
                     next_train = candidate
                     break
+            
             if next_train is not None and pd.notna(next_train['act_mins']) and next_train['act_mins'] > 0:
                 diff = next_train['act_mins'] - row['sched_mins']
                 if diff < -1000: diff += 1440
@@ -137,6 +165,7 @@ def process_delays(trains_df):
             else:
                 delay = 999 
                 notes = "Cancelled (No replacement)"
+        
         elif pd.notna(row['act_mins']) and pd.notna(row['sched_mins']):
             diff = row['act_mins'] - row['sched_mins']
             if diff < -1000: diff += 1440
@@ -154,14 +183,13 @@ def process_delays(trains_df):
             "Delay_Mins": delay, "Status": notes, "url": row['url'],
             "lookup_station": lookup_station
         })
+        
     return pd.DataFrame(results)
 
-# Cache data so resizing the window doesn't re-run the scrape
 @st.cache_data(show_spinner=False)
 def run_full_scrape(date_list, am_hours, pm_hours):
     all_raw_data = []
     
-    # Progress bar logic handled in UI section loop
     for d in date_list:
         date_str = d.strftime("%Y-%m-%d")
         display_date = d.strftime("%d/%m/%Y")
@@ -187,7 +215,7 @@ def run_full_scrape(date_list, am_hours, pm_hours):
                             filters = job['filter'] if isinstance(job['filter'], list) else [job['filter']]
                             if any(f in origin for f in filters):
                                 all_raw_data.append({
-                                    "date": display_date, "dt_obj": d, "direction": job['dir'], "origin": origin,
+                                    "dt_obj": d, "direction": job['dir'], "origin": origin,
                                     "dest_code": job['dest_code'], "sched_str": sched, "act_str": act,
                                     "sched_mins": clean_time(sched), "act_mins": clean_time(act),
                                     "status_raw": status, "url": row.get('href')
@@ -198,7 +226,7 @@ def run_full_scrape(date_list, am_hours, pm_hours):
     if not all_raw_data: return pd.DataFrame()
     raw_df = pd.DataFrame(all_raw_data)
     final_dfs = []
-    for (d, direct, dest), group in raw_df.groupby(['date', 'direction', 'dest_code']):
+    for (d, direct, dest), group in raw_df.groupby(['dt_obj', 'direction', 'dest_code']):
         final_dfs.append(process_delays(group.copy()))
     if not final_dfs: return pd.DataFrame()
     return pd.concat(final_dfs).drop_duplicates(subset=['dt_obj', 'From', 'To', 'Sched Arr']).reset_index(drop=True)
@@ -210,59 +238,64 @@ def run_full_scrape(date_list, am_hours, pm_hours):
 st.title("🚄 Southeastern Delay Repay Finder")
 st.caption("Sevenoaks ↔️ London Charing Cross / Cannon Street")
 
-# --- CONTROLS ---
+# --- DATE CONTROLS ---
 with st.container():
     col1, col2 = st.columns(2)
     with col1:
-        mode = st.radio("Date Selection", ["Last N Days", "Date Range"], horizontal=True)
+        mode = st.radio("Date Selection", ["Last N Days", "Date Range"], horizontal=True, label_visibility="collapsed")
     with col2:
         weekends = st.checkbox("Exclude Weekends", value=False)
 
+    date_list = []
     if mode == "Last N Days":
         days = st.slider("Lookback Days", 1, 30, 7)
-        date_list = []
         curr = date.today()
         for _ in range(days):
             if not weekends or curr.weekday() < 5: date_list.append(curr)
             curr -= timedelta(days=1)
     else:
         c1, c2 = st.columns(2)
-        start = c1.date_input("Start Date", date.today() - timedelta(days=7))
-        end = c2.date_input("End Date", date.today())
-        date_list = []
+        start = c1.date_input("Start", date.today() - timedelta(days=7))
+        end = c2.date_input("End", date.today())
         curr = start
         while curr <= end:
             if not weekends or curr.weekday() < 5: date_list.append(curr)
             curr += timedelta(days=1)
         date_list.sort(reverse=True)
 
-    with st.expander("⏰ Select Hours", expanded=False):
-        c1, c2 = st.columns(2)
-        hour_opts = [f"{h:02d}00" for h in range(5, 24)]
-        with c1:
-            am_hours = st.multiselect("Morning (To London)", hour_opts, default=['0700', '0800', '0900'])
-        with c2:
-            pm_hours = st.multiselect("Evening (To Home)", hour_opts, default=['1700', '1800', '1900'])
+# --- HOUR CONTROLS ---
+c1, c2 = st.columns(2)
+hour_opts = [f"{h:02d}00" for h in range(5, 24)]
+with c1:
+    with st.expander(f"Morning (To London)", expanded=False):
+        am_hours = st.multiselect("Select Hours", hour_opts, default=['0700', '0800', '0900'], label_visibility="collapsed")
+with c2:
+    with st.expander(f"Evening (To Home)", expanded=False):
+        pm_hours = st.multiselect("Select Hours", hour_opts, default=['1700', '1800', '1900'], label_visibility="collapsed")
 
-# --- EXECUTION ---
-if st.button("🔎 Check for Delays", type="primary", use_container_width=True):
-    
-    status_text = st.empty()
-    progress_bar = st.progress(0)
-    
-    status_text.text("Scanning schedules...")
-    
-    # 1. Run Main Scrape
+st.markdown("---")
+
+# --- ACTION AREA ---
+col_btn, col_prog, col_dl = st.columns([2, 4, 2])
+with col_btn:
+    start_btn = st.button("🔎 Check Delays", type="primary", use_container_width=True)
+
+if start_btn:
+    with col_prog:
+        status_text = st.empty()
+        pbar = st.progress(0)
+        status_text.caption("Scanning schedules...")
+
+    # 1. Main Scrape
     df = run_full_scrape(date_list, am_hours, pm_hours)
-    progress_bar.progress(50)
-    
+    pbar.progress(40)
+
     if df.empty:
-        st.warning("No data found for the selected dates/hours.")
+        st.warning("No data found.")
+        pbar.progress(100)
     else:
-        # 2. Filter & Enrich
+        # 2. Filter Top 5 > 15m
         delayed = df[df['Delay_Mins'] >= 15].copy()
-        
-        # Limit Top 5 per day
         top_delays = []
         for d in date_list:
             day_subset = delayed[delayed['dt_obj'] == d]
@@ -270,97 +303,92 @@ if st.button("🔎 Check for Delays", type="primary", use_container_width=True):
         
         target_df = pd.concat(top_delays) if top_delays else pd.DataFrame()
         
-        # Enrich Sched Dep
+        # 3. Enrich Sched Dep
         total_enrich = len(target_df)
         if total_enrich > 0:
-            status_text.text(f"Found {total_enrich} delays. Fetching detailed departure times...")
+            status_text.caption(f"Fetching {total_enrich} details...")
             for i, idx in enumerate(target_df.index):
                 row = df.loc[idx]
                 df.at[idx, 'Sched Dep'] = fetch_detailed_departure(row['url'], row['lookup_station'])
-                progress_bar.progress(50 + int((i / total_enrich) * 50))
+                pbar.progress(40 + int((i / total_enrich) * 60))
                 time.sleep(0.1)
         
-        progress_bar.progress(100)
-        status_text.empty()
+        pbar.progress(100)
+        status_text.caption("Done.")
 
-        # 3. Prepare Display
+        # 4. Prepare Display
         display_rows = []
         for d in date_list:
-            formatted_date = format_date_ordinal(d)
-            
+            fmt_date = format_date_ordinal(d)
             if not target_df.empty:
                 day_data = df.loc[df.index.isin(target_df[target_df['dt_obj'] == d].index)].copy()
                 if not day_data.empty:
                     day_data = day_data.sort_values("Delay_Mins", ascending=False)
-                    day_data['Date'] = formatted_date
-                    day_data['is_first_row'] = False
-                    day_data.iloc[0, day_data.columns.get_loc('is_first_row')] = True
+                    day_data['Date'] = fmt_date
+                    day_data['is_first'] = False
+                    day_data.iloc[0, day_data.columns.get_loc('is_first')] = True
                     display_rows.extend(day_data.to_dict('records'))
                 else:
-                    display_rows.append({"Date": formatted_date, "From": "No delays >15mn", "Status": "-", "Delay_Mins": 0, "is_first_row": True})
+                    display_rows.append({"Date": fmt_date, "From": "No delays >15mn", "Status": "-", "Delay_Mins": 0, "is_first": True})
             else:
-                display_rows.append({"Date": formatted_date, "From": "No delays >15mn", "Status": "-", "Delay_Mins": 0, "is_first_row": True})
+                display_rows.append({"Date": fmt_date, "From": "No delays >15mn", "Status": "-", "Delay_Mins": 0, "is_first": True})
 
-        final_display = pd.DataFrame(display_rows)
+        final_df = pd.DataFrame(display_rows)
         
-        # CSV Download
+        # 5. CSV Download (Includes Sched Dep even if hidden in table)
         if not target_df.empty:
             csv_data = df.loc[target_df.index].drop(columns=['url', 'lookup_station', 'dt_obj'], errors='ignore').to_csv(index=False)
-            st.download_button("📥 Download CSV", csv_data, "delay_repay.csv", "text/csv", use_container_width=True)
+            with col_dl:
+                st.download_button("📥 CSV", csv_data, "delays.csv", "text/csv", use_container_width=True)
 
-        # 4. Styling & Rendering
-        cols = ["Date", "From", "To", "Sched Dep", "Sched Arr", "Actual Arr", "Status", "Check"]
+        # 6. Final Table
+        # Columns requested: Date, From, To, Sched Arr, Act Arr, Status, Link
+        # (Sched Dep kept in CSV but hidden here)
+        final_df['Link'] = final_df['url'].apply(lambda x: f"https://www.realtimetrains.co.uk{x}" if x and len(str(x))>5 else None)
         
-        def make_clickable(url):
-            if isinstance(url, str) and len(url) > 5:
-                return f"https://www.realtimetrains.co.uk{url}"
-            return None
-
-        # Streamlit allows LinkColumn, but for custom "View" text we use pandas styler or column config
-        # Using Styler for coloring
+        cols_to_show = ["Date", "From", "To", "Sched Arr", "Actual Arr", "Status", "Link"]
         
-        final_display['Check'] = final_display.get('url', '').apply(make_clickable)
-
-        def style_dataframe(row):
+        def style_df(row):
             # Dark Mode Base
-            bg = '#1e1e1e' # Dark Grey
-            color = '#e0e0e0' # Soft White
+            bg = '#1e1e1e'
+            color = '#e0e0e0'
             
-            # Date Grouping (Subtle Divider)
-            border = 'border-top: 1px solid #444;' if row.get('is_first_row') else 'border-top: 1px solid #2a2a2a;'
+            # Subtle Date Grouping (Alternating very subtle grey)
+            # We use is_first to draw a border
+            border = 'border-top: 1px solid #444;' if row.get('is_first') else 'border-top: 1px solid #2a2a2a;'
             
             base = f'background-color: {bg}; color: {color}; border-bottom: 1px solid #2a2a2a;'
             styles = [f'{base} {border}'] * len(row)
             
-            # Hide Date text if not first row
-            if not row.get('is_first_row'):
+            # Hide Date if not first
+            if not row.get('is_first'):
                 styles[0] = f'{base} {border} color: {bg};' 
             else:
                 styles[0] = f'{base} {border} font-weight: bold; color: #90caf9;' 
 
-            # Status Column Coloring
+            # Status Column Coloring (Index 5 in this view)
             mins = row['Delay_Mins']
-            stat_color = color
+            stat_c = color
             
-            if mins >= 60: stat_color = '#ef5350' # Soft Red
-            elif mins >= 30: stat_color = '#ff8a65' # Coral
-            elif mins >= 15: stat_color = '#ffe082' # Pastel Gold
+            if mins >= 60: stat_c = '#ef5350' # Red
+            elif mins >= 30: stat_c = '#ff8a65' # Orange
+            elif mins >= 15: stat_c = '#ffe082' # Gold
             
             if "CANCELLED" in str(row['Status']):
-                if mins == 0: stat_color = '#ffe082' 
-                styles[6] = f'{base} {border} color: {stat_color}; font-style: italic;'
+                if mins == 0: stat_c = '#ffe082'
+                styles[5] = f'{base} {border} color: {stat_c}; font-style: italic;'
             elif "No delays" in str(row['From']):
                 styles[1] = f'{base} {border} color: #757575; font-style: italic;'
             else:
-                styles[6] = f'{base} {border} color: {stat_color};'
+                styles[5] = f'{base} {border} color: {stat_c}; font-weight: bold;'
 
             return styles
 
         st.dataframe(
-            final_display.style.apply(style_dataframe, axis=1),
+            final_df[cols_to_show + ['Delay_Mins', 'is_first']].style.apply(style_df, axis=1),
             column_config={
-                "Check": st.column_config.LinkColumn("Link", display_text="View"),
-                "Delay_Mins": None, "is_first_row": None, "dt_obj": None, "url": None
+                "Link": st.column_config.LinkColumn("Link", display_text="View"),
+                "Delay_Mins": None, "is_first": None
             },
             hide_index=True,
             use_container_width=True,
